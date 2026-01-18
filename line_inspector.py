@@ -30,12 +30,12 @@ from core.line_algorithm import LineDefectAlgorithm
 
 
 # ==============================================================================
-# 🟢 弹窗 1: 批量坐标截图设置
+# 🟢 弹窗 1: 批量坐标截图设置 (Excel 矩阵版)
 # ==============================================================================
 class BatchSnapDialog(QDialog):
     def __init__(self, file_list, default_path, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Batch Coordinate Snapper")
+        self.setWindowTitle("Batch Coordinate Snapper (Excel Matrix)")
         self.resize(600, 600)
         self.default_path = default_path
         self.file_list = file_list if file_list else []
@@ -44,7 +44,6 @@ class BatchSnapDialog(QDialog):
         self.init_ui()
         self.apply_styles()
 
-        # 尝试自动扫描
         if not self.file_list and self.default_path and os.path.exists(self.default_path):
             self.scan_source_folder()
         else:
@@ -194,59 +193,117 @@ class BatchSnapDialog(QDialog):
         self.lbl_count.setText(f"Match: {len(f)}")
 
     def run_process(self):
-        targets = [x for x in self.file_list if self.txt_filter.text().lower() in Path(x).name.lower()]
-        if not targets: return
+        # 1. 获取要处理的图片列表
+        image_files = [x for x in self.file_list if self.txt_filter.text().lower() in Path(x).name.lower()]
+        if not image_files:
+            QMessageBox.warning(self, "Warn", "No images matched!")
+            return
+
         base = self.edt_out.text()
-        save_dir = os.path.join(base, f"Snap_{datetime.now().strftime('%H%M%S')}")
-        os.makedirs(save_dir, exist_ok=True)
+        time_str = datetime.now().strftime('%H%M%S')
+        save_dir = os.path.join(base, f"SnapMatrix_{time_str}")
+        temp_img_dir = os.path.join(save_dir, "temp_images")  # 临时放图片
+        os.makedirs(temp_img_dir, exist_ok=True)
 
         fixed_is_horz = "Horizontal" in self.combo_dir.currentText()
         pad = self.sb_pad.value()
         mode_csv = (self.combo_mode.currentIndex() == 1)
 
+        # 2. 准备任务列表 (行)
         if mode_csv:
             if not self.csv_targets:
                 QMessageBox.warning(self, "Warn", "CSV loaded but no valid targets found!")
                 return
-            tasks = self.csv_targets
+            tasks = self.csv_targets  # [(idx, is_horz), ...]
         else:
             tasks = [(self.sb_idx.value(), fixed_is_horz)]
 
-        self.pbar.setRange(0, len(targets))
-        count = 0
-        for i, fpath in enumerate(targets):
-            self.pbar.setValue(i + 1)
+        # 3. 创建 Excel
+        excel_path = os.path.join(save_dir, f"Snap_Report_{time_str}.xlsx")
+        workbook = xlsxwriter.Workbook(excel_path)
+        worksheet = workbook.add_worksheet("Snapshots")
+
+        # 样式
+        fmt_header = workbook.add_format(
+            {'bold': True, 'bg_color': '#D3D3D3', 'border': 1, 'align': 'center', 'valign': 'vcenter'})
+        fmt_row_header = workbook.add_format(
+            {'bold': True, 'bg_color': '#E0E0E0', 'border': 1, 'align': 'center', 'valign': 'vcenter'})
+
+        # 4. 写入表头 (列：图片文件名)
+        worksheet.write(0, 0, "Coordinate \\ Image", fmt_header)
+        worksheet.set_column(0, 0, 20)  # 第一列宽度
+
+        for col_idx, img_path in enumerate(image_files):
+            fname = Path(img_path).name
+            worksheet.write(0, col_idx + 1, fname, fmt_header)
+            worksheet.set_column(col_idx + 1, col_idx + 1, 40)  # 图片列宽
+
+        # 5. 遍历处理
+        self.pbar.setRange(0, len(image_files))
+
+        # 这里的逻辑稍微反转一下：为了性能，我们按图片遍历（外层），然后切每行（内层）
+        # 但写入 Excel 时，我们要按 (row, col) 写入
+
+        for col_idx, img_path in enumerate(image_files):
+            self.pbar.setValue(col_idx + 1)
             QApplication.processEvents()
-            stem = Path(fpath).stem
-            img = cv2.imread(fpath, cv2.IMREAD_UNCHANGED)
+
+            img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
             if img is None: continue
             h, w = img.shape[:2]
 
-            for (idx, is_horz) in tasks:
+            for row_idx, (idx, is_horz) in enumerate(tasks):
+                # 写入行头 (只在处理第一张图时写一次)
+                if col_idx == 0:
+                    dir_str = "Row (H)" if is_horz else "Col (V)"
+                    label = f"{dir_str} {idx}"
+                    worksheet.write(row_idx + 1, 0, label, fmt_row_header)
+                    worksheet.set_row(row_idx + 1, 100)  # 设置行高以容纳图片
+
+                # 截图逻辑
                 crop = None
-                suffix = "H" if is_horz else "V"
                 if is_horz:
                     y0, y1 = max(0, idx - pad), min(h, idx + pad)
                     crop = img[y0:y1, :]
                 else:
                     x0, x1 = max(0, idx - pad), min(w, idx + pad)
                     crop = img[:, x0:x1]
-                    if crop.size > 0: crop = cv2.rotate(crop, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                    # 竖线旋转
+                    if crop.size > 0:
+                        crop = cv2.rotate(crop, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
-                if crop.size > 0:
+                if crop is not None and crop.size > 0:
+                    # 转 8-bit 用于保存
                     if crop.dtype == np.uint16:
                         vis = cv2.normalize(crop, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
                     else:
                         vis = crop.astype(np.uint8)
-                    out_name = f"{stem}_{suffix}_idx{idx}.png"
-                    cv2.imwrite(os.path.join(save_dir, out_name), vis)
-                    count += 1
-        QMessageBox.information(self, "Done", f"Saved {count} images to:\n{save_dir}");
+
+                    # 保存临时图片
+                    # 命名规则: col_row.png
+                    tmp_name = f"c{col_idx}_r{row_idx}.png"
+                    tmp_path = os.path.join(temp_img_dir, tmp_name)
+                    cv2.imwrite(tmp_path, vis)
+
+                    # 插入 Excel
+                    worksheet.insert_image(row_idx + 1, col_idx + 1, tmp_path, {
+                        'x_scale': 0.5,
+                        'y_scale': 0.5,
+                        'object_position': 1,  # Move and size with cells
+                        'x_offset': 5,
+                        'y_offset': 5
+                    })
+
+        workbook.close()
+
+        # 可选：清理临时文件夹 (如果不想要那一堆碎图)
+        # shutil.rmtree(temp_img_dir)
+
+        QMessageBox.information(self, "Done", f"Excel Matrix generated at:\n{excel_path}")
         self.accept()
 
     def apply_styles(self):
         self.setStyleSheet("QDialog{background:#1a1a1a;color:#fff} QGroupBox{border:1px solid #444;color:#0e6}")
-
 
 # ==============================================================================
 # 🟢 弹窗 2: 批量 Pass/Fail 分析设置
@@ -598,9 +655,9 @@ class LineInspectorApp(QMainWindow):
         l_layout.addWidget(grp_src)
 
         h_batch_btns = QHBoxLayout()
-        self.btn_pop_analysis = QPushButton("⚡ Batch Analysis")
+        self.btn_pop_analysis = QPushButton("⚡ Batch")
         self.btn_pop_analysis.clicked.connect(self.open_batch_analysis_dialog)
-        self.btn_pop_snap = QPushButton("✂️ Batch Snap")
+        self.btn_pop_snap = QPushButton("✂️ Crop")
         self.btn_pop_snap.clicked.connect(self.open_batch_snap_dialog)
         h_batch_btns.addWidget(self.btn_pop_analysis)
         h_batch_btns.addWidget(self.btn_pop_snap)
