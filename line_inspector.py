@@ -572,7 +572,7 @@ class LineInspectorApp(QMainWindow):
         else:
             # 开发时：配置文件生成在脚本同级目录
             base_path = os.path.dirname(os.path.abspath(__file__))
-        return os.path.join(base_path, "dline.config.ini")
+        return os.path.join(base_path, "Defect Line config.ini")
 
     # 🟢 [新增] 加载配置 (若文件不存在，自动生成默认值)
     def load_config(self):
